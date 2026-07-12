@@ -1,0 +1,248 @@
+name: Deploy to Cloudflare Workers
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'workers/**'
+      - '.github/workflows/deploy-workers.yml'
+
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Deployment environment'
+        required: true
+        default: 'production'
+        type: choice
+        options:
+          - staging
+          - production
+
+  workflow_call:
+    inputs:
+      environment:
+        description: 'Deployment environment'
+        required: false
+        default: 'production'
+        type: string
+    outputs:
+      workers_url:
+        description: 'Deployed Workers base URL'
+        value: ${{ jobs.deploy.outputs.workers_url }}
+
+env:
+  NODE_VERSION: '24'
+
+jobs:
+  deploy:
+    name: Deploy Workers (${{ inputs.environment || github.event.inputs.environment || 'production' }})
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment || github.event.inputs.environment || 'production' }}
+    outputs:
+      workers_url: ${{ steps.export_workers_url.outputs.workers_url }}
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+          cache-dependency-path: workers/package-lock.json
+
+      - name: Install dependencies
+        working-directory: workers
+        run: npm ci
+
+      - name: Type check
+        working-directory: workers
+        run: npm run check
+
+      - name: Verify secrets are configured
+        run: |
+          if [ -z "${{ secrets.CLOUDFLARE_API_TOKEN }}" ]; then
+            echo "❌ ERROR: CLOUDFLARE_API_TOKEN secret is not set"
+            exit 1
+          fi
+          if [ -z "${{ secrets.CLOUDFLARE_ACCOUNT_ID }}" ]; then
+            echo "❌ ERROR: CLOUDFLARE_ACCOUNT_ID secret is not set"
+            exit 1
+          fi
+          echo "✅ Required secrets are configured"
+
+      - name: Set environment variables
+        run: |
+          ENVIRONMENT="${{ inputs.environment || github.event.inputs.environment || 'production' }}"
+          echo "ENVIRONMENT=$ENVIRONMENT" >> $GITHUB_ENV
+
+          # Determine worker name based on environment
+          if [ "$ENVIRONMENT" == "staging" ]; then
+            echo "WORKERS_NAME=cloudflare-image-workers-staging" >> $GITHUB_ENV
+          else
+            echo "WORKERS_NAME=cloudflare-image-workers" >> $GITHUB_ENV
+          fi
+
+          echo "Deploying to $ENVIRONMENT as ${{ env.WORKERS_NAME }}"
+
+      - name: Generate wrangler.toml
+        working-directory: workers
+        run: |
+          # Generate wrangler.toml dynamically from GitHub secrets
+          # This ensures single source of truth (GitHub Secrets/Terraform)
+          cat > wrangler.toml << EOF
+          name = "${{ env.WORKERS_NAME }}"
+          account_id = "${{ secrets.CLOUDFLARE_ACCOUNT_ID }}"
+          compatibility_date = "2025-01-01"
+          main = "src/index.ts"
+
+          # R2 Bucket binding
+          [[r2_buckets]]
+          binding = "IMAGE_BUCKET"
+          bucket_name = "cloudflare-image-mcp-images"
+
+          # Environment variables
+          [vars]
+          IMAGE_EXPIRY_HOURS = "24"
+          # API_KEYS is set as secret via wrangler secret put
+          EOF
+
+          echo "✅ wrangler.toml generated successfully"
+          # Only show non-sensitive parts
+          echo "Worker name: ${{ env.WORKERS_NAME }}"
+          echo "Bucket: cloudflare-image-mcp-images"
+          echo "(wrangler.toml content hidden for security)"
+
+      - name: Set deployment metadata
+        working-directory: workers
+        run: |
+          # Set deployment timestamp and commit SHA
+          echo "DEPLOYED_AT=$(date -u +"%Y-%m-%dT%H:%M:%SZ")" >> $GITHUB_ENV
+          echo "COMMIT_SHA=${{ github.sha }}" >> $GITHUB_ENV
+
+      - name: Check optional secrets
+        run: |
+          if [ -z "${{ secrets.API_KEYS }}" ]; then
+            echo "ℹ️ API_KEYS not set (endpoints are public)"
+          fi
+          echo "✅ Secrets check completed"
+
+      - name: Deploy to Cloudflare Workers
+        working-directory: workers
+        run: npx wrangler deploy
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+
+      - name: Set Worker secrets
+        working-directory: workers
+        run: |
+          # Set deployment metadata as secrets for visibility
+          echo "${{ env.DEPLOYED_AT }}" | npx wrangler secret put DEPLOYED_AT --name ${{ env.WORKERS_NAME }}
+          echo "${{ github.sha }}" | npx wrangler secret put COMMIT_SHA --name ${{ env.WORKERS_NAME }}
+
+          # Required: AI inference credentials (used by REST API to call Workers AI)
+          echo "${{ secrets.CLOUDFLARE_ACCOUNT_ID }}" | npx wrangler secret put CLOUDFLARE_ACCOUNT_ID --name ${{ env.WORKERS_NAME }}
+          echo "${{ secrets.CLOUDFLARE_API_TOKEN }}" | npx wrangler secret put CLOUDFLARE_API_TOKEN --name ${{ env.WORKERS_NAME }}
+
+          # Optional runtime configuration
+          if [ -n "${{ secrets.API_KEYS }}" ]; then
+            echo "${{ secrets.API_KEYS }}" | npx wrangler secret put API_KEYS --name ${{ env.WORKERS_NAME }}
+          fi
+          if [ -n "$AI_ACCOUNTS_VALUE" ]; then
+            echo "$AI_ACCOUNTS_VALUE" | npx wrangler secret put AI_ACCOUNTS --name ${{ env.WORKERS_NAME }}
+          fi
+          if [ -n "${{ secrets.TZ }}" ]; then
+            echo "${{ secrets.TZ }}" | npx wrangler secret put TZ --name ${{ env.WORKERS_NAME }}
+          fi
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          AI_ACCOUNTS_VALUE: ${{ secrets.AI_ACCOUNTS }}
+
+      - name: Derive Workers URL
+        run: |
+          echo "Fetching account workers.dev subdomain via Cloudflare API..."
+          SUBDOMAIN=$(curl -sS \
+            -H "Authorization: Bearer ${{ secrets.CLOUDFLARE_API_TOKEN }}" \
+            "https://api.cloudflare.com/client/v4/accounts/${{ secrets.CLOUDFLARE_ACCOUNT_ID }}/workers/subdomain" \
+            | node -e "let s='';process.stdin.on('data',d=>s+=d);process.stdin.on('end',()=>{const j=JSON.parse(s); if(!j.success){ console.error(JSON.stringify(j.errors||j, null, 2)); process.exit(1);} console.log(j.result?.subdomain||'');});")
+
+          if [ -z "$SUBDOMAIN" ]; then
+            echo "❌ Could not derive workers.dev subdomain"
+            exit 1
+          fi
+
+          WORKERS_URL="https://${{ env.WORKERS_NAME }}.${SUBDOMAIN}.workers.dev"
+          echo "WORKERS_URL=$WORKERS_URL" >> $GITHUB_ENV
+          echo "✅ Workers URL: $WORKERS_URL"
+
+      - name: Export Workers URL
+        id: export_workers_url
+        run: |
+          echo "workers_url=$WORKERS_URL" >> $GITHUB_OUTPUT
+
+      # NOTE: This workflow does not create a GitHub Deployment object, so deployment statuses are not applicable.
+      # Leaving this step disabled avoids failing deployments with 404s.
+      # - name: Update deployment status
+      #   uses: actions/github-script@v7
+      #   with:
+      #     script: |
+      #       const workersUrl = process.env.WORKERS_URL;
+      #       const deploymentId = context.payload.deployment?.id;
+      #
+      #       if (!deploymentId) {
+      #         core.info('No GitHub deployment id present; skipping deployment status update.');
+      #         return;
+      #       }
+      #
+      #       if (workersUrl) {
+      #         await github.rest.repos.createDeploymentStatus({
+      #           owner: context.repo.owner,
+      #           repo: context.repo.repo,
+      #           deployment_id: deploymentId,
+      #           state: 'success',
+      #           environment_url: workersUrl,
+      #           log_url: `https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}`,
+      #         });
+      #       }
+
+      - name: Deployment summary
+        if: success()
+        run: |
+          echo "## ✅ Deployment Successful" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Environment:** ${{ env.ENVIRONMENT }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Worker Name:** ${{ env.WORKERS_NAME }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Workers URL:** ${{ env.WORKERS_URL }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Commit:** ${{ github.sha }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Endpoints Available" >> $GITHUB_STEP_SUMMARY
+          echo "- Frontend: ${{ env.WORKERS_URL }}/" >> $GITHUB_STEP_SUMMARY
+          echo "- OpenAI API: ${{ env.WORKERS_URL }}/v1/images/generations" >> $GITHUB_STEP_SUMMARY
+          echo "- MCP HTTP: ${{ env.WORKERS_URL }}/mcp" >> $GITHUB_STEP_SUMMARY
+          echo "- MCP SSE: ${{ env.WORKERS_URL }}/mcp?transport=sse" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Secrets Configured" >> $GITHUB_STEP_SUMMARY
+          echo "- API_KEYS: ${{ secrets.API_KEYS != '' && '✅ Configured' || '❌ Missing' }}" >> $GITHUB_STEP_SUMMARY
+          echo "- AI_ACCOUNTS: ${{ secrets.AI_ACCOUNTS != '' && '✅ Configured (multi-account)' || 'ℹ️ Not set (using deploy credentials)' }}" >> $GITHUB_STEP_SUMMARY
+
+      - name: Cleanup sensitive files
+        if: always()
+        working-directory: workers
+        run: |
+          # Explicitly remove wrangler.toml to ensure no credential leakage
+          # Note: account_id is not secret (it's in the public URL), but we clean up anyway
+          rm -f wrangler.toml
+          echo "✅ Cleaned up wrangler.toml"
+
+      - name: Notify on failure
+        if: failure()
+        run: |
+          echo "## ❌ Deployment Failed" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Check the logs above for error details." >> $GITHUB_STEP_SUMMARY
